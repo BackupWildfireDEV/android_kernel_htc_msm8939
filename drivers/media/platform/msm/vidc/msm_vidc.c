@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -22,7 +22,6 @@
 #include <linux/delay.h>
 #include "vidc_hfi_api.h"
 #include "msm_vidc_dcvs.h"
-#include "htc_msm_smem.h"
 
 #define MAX_EVENTS 30
 
@@ -80,6 +79,7 @@ int msm_vidc_poll(void *instance, struct file *filp,
 }
 EXPORT_SYMBOL(msm_vidc_poll);
 
+/* Kernel client alternative for msm_vidc_poll */
 int msm_vidc_wait(void *instance)
 {
 	struct msm_vidc_inst *inst = instance;
@@ -337,23 +337,16 @@ struct buffer_info *device_to_uvaddr(struct msm_vidc_list *buf_list,
 
 	mutex_lock(&buf_list->lock);
 	list_for_each_entry(temp, &buf_list->list, list) {
-		
-		if (temp) {
-			for (i = 0; (i < temp->num_planes)
-				&& (i < VIDEO_MAX_PLANES); i++) {
-				if (temp && !temp->inactive &&
-					temp->device_addr[i] == device_addr)  {
-					dprintk(VIDC_INFO,
-					"Found same fd buffer\n");
-					found = 1;
-					break;
-				}
+		for (i = 0; (i < temp->num_planes)
+			&& (i < VIDEO_MAX_PLANES); i++) {
+			if (temp && !temp->inactive &&
+				temp->device_addr[i] == device_addr)  {
+				dprintk(VIDC_INFO,
+				"Found same fd buffer\n");
+				found = 1;
+				break;
 			}
-		} else {
-			dprintk(VIDC_ERR,
-				"Get NULL buffer_info!\n");
 		}
-		
 		if (found)
 			break;
 	}
@@ -431,12 +424,14 @@ static inline enum hal_buffer get_hal_buffer_type(
 	if (inst->session_type == MSM_VIDC_DECODER) {
 		if (b->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
 			return HAL_BUFFER_INPUT;
-		else 
+		else /* V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE */
 			return HAL_BUFFER_OUTPUT;
 	} else {
+		/* FIXME in the future.  See comment in msm_comm_get_\
+		 * domain_partition. Same problem here. */
 		if (b->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
 			return HAL_BUFFER_OUTPUT;
-		else 
+		else /* V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE */
 			return HAL_BUFFER_INPUT;
 	}
 	return -EINVAL;
@@ -510,6 +505,14 @@ int map_and_register_buf(struct msm_vidc_inst *inst, struct v4l2_buffer *b)
 
 		if (temp && is_dynamic_output_buffer_mode(b, inst) &&
 			(i == 0)) {
+			/*
+			* Buffer is already present in registered list
+			* increment ref_count, populate new values of v4l2
+			* buffer in existing buffer_info struct.
+			*
+			* We will use the saved buffer info and queue it when
+			* we receive RELEASE_BUFFER_REFERENCE EVENT from f/w.
+			*/
 			dprintk(VIDC_DBG, "[MAP] Buffer already prepared\n");
 			mutex_lock(&inst->registeredbufs.lock);
 			list_for_each_entry(iterator,
@@ -529,10 +532,8 @@ int map_and_register_buf(struct msm_vidc_inst *inst, struct v4l2_buffer *b)
 		if (rc < 0)
 			goto exit;
 
-		if (!is_dynamic_output_buffer_mode(b, inst))
-			same_fd_handle = get_same_fd_buffer(
-						&inst->registeredbufs,
-						b->m.planes[i].reserved[0]);
+		same_fd_handle = get_same_fd_buffer(&inst->registeredbufs,
+					b->m.planes[i].reserved[0]);
 
 		populate_buf_info(binfo, b, i);
 		if (same_fd_handle) {
@@ -543,13 +544,6 @@ int map_and_register_buf(struct msm_vidc_inst *inst, struct v4l2_buffer *b)
 			binfo->handle[i] = same_fd_handle;
 		} else {
 			if (inst->map_output_buffer) {
-#if 1
-                                dprintk(VIDC_WARN,
-                                        "[Vidc_Mem][%p] Import_%s: UsrAddr(%lx) FD(%d)\n",
-                                        inst, ((get_hal_buffer_type(inst, b) == HAL_BUFFER_INPUT)? "I":"O"),
-                                        binfo->uvaddr[i], b->m.planes[i].reserved[0]);
-#endif
-                                
 				binfo->handle[i] =
 					map_buffer(inst, &b->m.planes[i],
 						get_hal_buffer_type(inst, b));
@@ -605,6 +599,10 @@ int unmap_and_deregister_buf(struct msm_vidc_inst *inst,
 
 	mutex_lock(&inst->registeredbufs.lock);
 
+	/*
+	* Make sure the buffer to be unmapped and deleted
+	* from the registered list is present in the list.
+	*/
 	list_for_each_entry(temp, &inst->registeredbufs.list, list) {
 		if (temp == binfo) {
 			found = true;
@@ -612,6 +610,12 @@ int unmap_and_deregister_buf(struct msm_vidc_inst *inst,
 		}
 	}
 
+	/*
+	* Free the buffer info only if
+	* - buffer info has not been deleted from registered list
+	* - vidc client has called dqbuf on the buffer
+	* - no references are held on the buffer
+	*/
 	if (!found || !temp || !temp->pending_deletion || !temp->dequeued)
 		goto exit;
 
@@ -621,6 +625,15 @@ int unmap_and_deregister_buf(struct msm_vidc_inst *inst,
 			__func__, temp, i, temp->handle[i],
 			&temp->device_addr[i], temp->fd[i],
 			temp->buff_off[i], temp->mapped[i]);
+		/*
+		* Unmap the handle only if the buffer has been mapped and no
+		* other buffer has a reference to this buffer.
+		* In case of buffers with same fd, we will map the buffer only
+		* once and subsequent buffers will refer to the mapped buffer's
+		* device address.
+		* For buffers which share the same fd, do not unmap and keep
+		* the buffer info in registered list.
+		*/
 		if (temp->handle[i] && temp->mapped[i] &&
 			!temp->same_fd_ref[i]) {
 			msm_comm_smem_free(inst,
@@ -721,13 +734,6 @@ int msm_vidc_prepare_buf(void *instance, struct v4l2_buffer *b)
 	if (!inst || !b)
 		return -EINVAL;
 
-	if (!V4L2_TYPE_IS_MULTIPLANAR(b->type) || !b->length ||
-		(b->length > VIDEO_MAX_PLANES)) {
-		dprintk(VIDC_ERR, "%s: wrong input params\n",
-				__func__);
-		return -EINVAL;
-	}
-
 	if (is_dynamic_output_buffer_mode(b, inst)) {
 		dprintk(VIDC_ERR, "%s: not supported in dynamic buffer mode\n",
 				__func__);
@@ -769,6 +775,11 @@ int msm_vidc_release_buffers(void *instance, int buffer_type)
 		}
 	}
 
+	/*
+	* In dynamic buffer mode, driver needs to release resources,
+	* but not call release buffers on firmware, as the buffers
+	* were never registered with firmware.
+	*/
 	if ((buffer_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) &&
 		(inst->buffer_mode_set[CAPTURE_PORT] ==
 				HAL_BUFFER_MODE_DYNAMIC)) {
@@ -875,10 +886,9 @@ int msm_vidc_qbuf(void *instance, struct v4l2_buffer *b)
 	if (!inst || !b)
 		return -EINVAL;
 
-	if (!V4L2_TYPE_IS_MULTIPLANAR(b->type) || !b->length ||
-		(b->length > VIDEO_MAX_PLANES)) {
-		dprintk(VIDC_ERR, "%s: wrong input params\n",
-				__func__);
+	if (b->length > VIDEO_MAX_PLANES) {
+		dprintk(VIDC_ERR, "num planes exceeds max: %d\n",
+			b->length);
 		return -EINVAL;
 	}
 
@@ -959,10 +969,9 @@ int msm_vidc_dqbuf(void *instance, struct v4l2_buffer *b)
 	if (!inst || !b)
 		return -EINVAL;
 
-	if (!V4L2_TYPE_IS_MULTIPLANAR(b->type) || !b->length ||
-		(b->length > VIDEO_MAX_PLANES)) {
-		dprintk(VIDC_ERR, "%s: wrong input params\n",
-				__func__);
+	if (b->length > VIDEO_MAX_PLANES) {
+		dprintk(VIDC_ERR, "num planes exceed maximum: %d\n",
+			b->length);
 		return -EINVAL;
 	}
 
@@ -1229,29 +1238,10 @@ int msm_vidc_dqevent(void *inst, struct v4l2_event *event)
 }
 EXPORT_SYMBOL(msm_vidc_dqevent);
 
-static bool msm_vidc_check_for_inst_overload(struct msm_vidc_core *core)
-{
-	u32 instance_count = 0;
-	struct msm_vidc_inst *inst = NULL;
-	bool overload = false;
-
-	mutex_lock(&core->lock);
-	list_for_each_entry(inst, &core->instances, list)
-		instance_count++;
-	mutex_unlock(&core->lock);
-
-	/* Instance count includes just opened instance as well. */
-
-	if (instance_count > core->max_supported_instances)
-		overload = true;
-	return overload;
-}
-
 void *msm_vidc_open(int core_id, int session_type)
 {
 	struct msm_vidc_inst *inst = NULL;
 	struct msm_vidc_core *core = NULL;
-        struct smem_client *smem_client = NULL;
 	int rc = 0;
 	int i = 0;
 	if (core_id >= MSM_VIDC_CORES_MAX ||
@@ -1282,7 +1272,7 @@ void *msm_vidc_open(int core_id, int session_type)
 	mutex_init(&inst->lock);
 
 	INIT_MSM_VIDC_LIST(&inst->pendingq);
-	INIT_MSM_VIDC_LIST(&inst->scratchbufs);
+	INIT_MSM_VIDC_LIST(&inst->internalbufs);
 	INIT_MSM_VIDC_LIST(&inst->persistbufs);
 	INIT_MSM_VIDC_LIST(&inst->pending_getpropq);
 	INIT_MSM_VIDC_LIST(&inst->outputbufs);
@@ -1298,17 +1288,12 @@ void *msm_vidc_open(int core_id, int session_type)
 		i <= SESSION_MSG_INDEX(SESSION_MSG_END); i++) {
 		init_completion(&inst->completions[i]);
 	}
-	inst->mem_client = htc_msm_smem_new_client(SMEM_ION,
+	inst->mem_client = msm_smem_new_client(SMEM_ION,
 					&inst->core->resources);
 	if (!inst->mem_client) {
 		dprintk(VIDC_ERR, "Failed to create memory client\n");
 		goto fail_mem_client;
 	}
-
-        smem_client = inst->mem_client;
-        smem_client->inst = inst;
-        
-
 	if (session_type == MSM_VIDC_DECODER) {
 		msm_vdec_inst_init(inst);
 		msm_vdec_ctrl_init(inst);
@@ -1336,26 +1321,17 @@ void *msm_vidc_open(int core_id, int session_type)
 	list_add_tail(&inst->list, &core->instances);
 	mutex_unlock(&core->lock);
 
-	rc = msm_comm_try_state(inst, MSM_VIDC_CORE_INIT_DONE);
+	rc = msm_comm_try_state(inst, MSM_VIDC_CORE_INIT);
 	if (rc) {
 		dprintk(VIDC_ERR,
 			"Failed to move video instance to init state\n");
 		goto fail_init;
 	}
-
-	if (msm_vidc_check_for_inst_overload(core)) {
-		dprintk(VIDC_ERR,
-			"Instance count reached Max limit, rejecting session");
-		goto fail_init;
-	}
-
 	inst->debugfs_root =
 		msm_vidc_debugfs_init_inst(inst, core->debugfs_root);
 
 	setup_event_queue(inst, &core->vdev[session_type].vdev);
 
-	pr_info(VIDC_DBG_TAG "Opening video instance finish : %p, %d\n",
-		VIDC_MSG_PRIO2STRING(VIDC_INFO), inst, session_type);
 	return inst;
 fail_init:
 	vb2_queue_release(&inst->bufq[OUTPUT_PORT].vb2_bufq);
@@ -1428,11 +1404,10 @@ int msm_vidc_close(void *instance)
 	int rc = 0;
 	int i;
 
-	if (!inst || !inst->core)
+	if (!inst)
 		return -EINVAL;
 
 	v4l2_fh_del(&inst->event_handler);
-	v4l2_fh_exit(&inst->event_handler);
 
 	mutex_lock(&inst->registeredbufs.lock);
 	list_for_each_entry_safe(bi, dummy, &inst->registeredbufs.list, list) {
@@ -1449,7 +1424,6 @@ int msm_vidc_close(void *instance)
 	mutex_unlock(&inst->registeredbufs.lock);
 
 	core = inst->core;
-
 	mutex_lock(&core->lock);
 	list_for_each_entry_safe(temp, inst_dummy, &core->instances, list) {
 		if (temp == inst)
@@ -1474,11 +1448,6 @@ int msm_vidc_close(void *instance)
 	if (rc)
 		dprintk(VIDC_ERR,
 			"Failed to move video instance to uninit state\n");
-
-	msm_comm_session_clean(inst);
-
-	v4l2_fh_del(&inst->event_handler);
-	v4l2_fh_exit(&inst->event_handler);
 
 	msm_smem_delete_client(inst->mem_client);
 
