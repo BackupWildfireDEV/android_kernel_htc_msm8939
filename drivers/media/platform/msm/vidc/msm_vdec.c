@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -17,9 +17,12 @@
 #include "msm_vidc_common.h"
 #include "vidc_hfi_api.h"
 #include "msm_vidc_debug.h"
+#include "msm_vidc_dcvs.h"
 
 #define MSM_VDEC_DVC_NAME "msm_vdec_8974"
 #define MIN_NUM_OUTPUT_BUFFERS 4
+#define MIN_NUM_CAPTURE_BUFFERS 6
+#define MIN_NUM_THUMBNAIL_MODE_CAPTURE_BUFFERS 1
 #define MAX_NUM_OUTPUT_BUFFERS VB2_MAX_FRAME
 #define DEFAULT_VIDEO_CONCEAL_COLOR_BLACK 0x8010
 #define MB_SIZE_IN_PIXEL (16 * 16)
@@ -786,6 +789,14 @@ int msm_vdec_prepare_buf(struct msm_vidc_inst *inst,
 	}
 	hdev = inst->core->device;
 
+	if (inst->state == MSM_VIDC_CORE_INVALID ||
+			inst->core->state == VIDC_CORE_INVALID) {
+		dprintk(VIDC_ERR,
+			"Core %p in bad state, ignoring prepare buf\n",
+				inst->core);
+		goto exit;
+	}
+
 	switch (b->type) {
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
 		break;
@@ -836,6 +847,7 @@ int msm_vdec_prepare_buf(struct msm_vidc_inst *inst,
 		dprintk(VIDC_ERR, "Buffer type not recognized: %d\n", b->type);
 		break;
 	}
+exit:
 	return rc;
 }
 
@@ -1149,7 +1161,7 @@ int msm_vdec_s_parm(struct msm_vidc_inst *inst, struct v4l2_streamparm *a)
 		dprintk(VIDC_PROF, "reported fps changed for %p: %d->%d\n",
 				inst, inst->prop.fps, fps);
 		inst->prop.fps = fps;
-		msm_comm_init_dcvs_load(inst);
+		msm_dcvs_init_load(inst);
 		msm_comm_scale_clocks_and_bus(inst);
 	}
 exit:
@@ -1369,6 +1381,8 @@ static int msm_vdec_queue_setup(struct vb2_queue *q,
 	struct hfi_device *hdev;
 	struct hal_buffer_count_actual new_buf_count;
 	enum hal_property property_id;
+	int min_buff_count = 0;
+
 	if (!q || !num_buffers || !num_planes
 		|| !sizes || !q->drv_priv) {
 		dprintk(VIDC_ERR, "Invalid input, q = %p, %p, %p\n",
@@ -1430,6 +1444,14 @@ static int msm_vdec_queue_setup(struct vb2_queue *q,
 			break;
 		}
 		*num_buffers = max(*num_buffers, bufreq->buffer_count_min);
+
+		min_buff_count = (!!(inst->flags & VIDC_THUMBNAIL)) ?
+			MIN_NUM_THUMBNAIL_MODE_CAPTURE_BUFFERS :
+			MIN_NUM_CAPTURE_BUFFERS;
+
+		*num_buffers = clamp_val(*num_buffers,
+			min_buff_count, VB2_MAX_FRAME);
+
 		if (*num_buffers != bufreq->buffer_count_actual) {
 			property_id = HAL_PARAM_BUFFER_COUNT_ACTUAL;
 			new_buf_count.buffer_type =
@@ -1518,7 +1540,7 @@ static inline int start_streaming(struct msm_vidc_inst *inst)
 			"Failed to move inst: %p to start done state\n", inst);
 		goto fail_start;
 	}
-	msm_comm_init_dcvs_load(inst);
+	msm_dcvs_init_load(inst);
 	if (msm_comm_get_stream_output_mode(inst) ==
 		HAL_VIDEO_DECODER_SECONDARY) {
 		rc = msm_comm_queue_output_buffers(inst);
@@ -1685,9 +1707,6 @@ int msm_vdec_cmd(struct msm_vidc_inst *inst, struct v4l2_decoder_cmd *dec)
 			goto exit;
 		}
 		rc = msm_comm_try_state(inst, MSM_VIDC_CLOSE_DONE);
-		/* Clients rely on this event for joining poll thread.
-		 * This event should be returned even if firmware has
-		 * failed to respond */
 		msm_vidc_queue_v4l2_event(inst, V4L2_EVENT_MSM_VIDC_CLOSE_DONE);
 		break;
 	default:
@@ -1763,10 +1782,6 @@ static int check_tz_dynamic_buffer_support(void)
 	int rc = 0;
 	int version = scm_get_feat_version(TZ_DYNAMIC_BUFFER_FEATURE_ID);
 
-	/*
-	 * if the version is < 1.1.0 then dynamic buffer allocation is
-	 * not supported
-	 */
 	if (version < TZ_FEATURE_VERSION(1, 1, 0)) {
 		dprintk(VIDC_DBG,
 			"Dynamic buffer mode not supported, tz version is : %u vs required : %u\n",
@@ -1940,6 +1955,7 @@ static int try_set_ctrl(struct msm_vidc_inst *inst, struct v4l2_ctrl *ctrl)
 	struct hal_mvc_buffer_layout layout;
 	struct v4l2_ctrl *temp_ctrl = NULL;
 	struct hal_profile_level profile_level;
+	struct hal_frame_size frame_sz;
 
 	if (!inst || !inst->core || !inst->core->device) {
 		dprintk(VIDC_ERR, "%s invalid parameters\n", __func__);
@@ -2146,9 +2162,26 @@ static int try_set_ctrl(struct msm_vidc_inst *inst, struct v4l2_ctrl *ctrl)
 			rc = call_hfi_op(hdev, session_set_property, (void *)
 				inst->session, HAL_PARAM_VDEC_MULTI_STREAM,
 				pdata);
+			if (rc) {
+				dprintk(VIDC_ERR,
+					"Failed disabling OUTPUT port : %d\n",
+					rc);
+				break;
+			}
+
+			frame_sz.buffer_type = HAL_BUFFER_OUTPUT2;
+			frame_sz.width = inst->prop.width[CAPTURE_PORT];
+			frame_sz.height = inst->prop.height[CAPTURE_PORT];
+			pdata = &frame_sz;
+			dprintk(VIDC_DBG,
+				"buffer type = %d width = %d, height = %d\n",
+				frame_sz.buffer_type, frame_sz.width,
+				frame_sz.height);
+			rc = call_hfi_op(hdev, session_set_property, (void *)
+				inst->session, HAL_PARAM_FRAME_SIZE, pdata);
 			if (rc)
 				dprintk(VIDC_ERR,
-					"Failed :Disabling OUTPUT port : %d\n",
+					"Failed setting OUTPUT2 size : %d\n",
 					rc);
 			break;
 		default:
@@ -2371,14 +2404,10 @@ int msm_vdec_ctrl_init(struct msm_vidc_inst *inst)
 	for (; idx < NUM_CTRLS; idx++) {
 		struct v4l2_ctrl *ctrl = NULL;
 		if (IS_PRIV_CTRL(msm_vdec_ctrls[idx].id)) {
-			/*add private control*/
+			
 			ctrl_cfg.def = msm_vdec_ctrls[idx].default_value;
 			ctrl_cfg.flags = 0;
 			ctrl_cfg.id = msm_vdec_ctrls[idx].id;
-			/* ctrl_cfg.is_private =
-			 * msm_vdec_ctrls[idx].is_private;
-			 * ctrl_cfg.is_volatile =
-			 * msm_vdec_ctrls[idx].is_volatile;*/
 			ctrl_cfg.max = msm_vdec_ctrls[idx].maximum;
 			ctrl_cfg.min = msm_vdec_ctrls[idx].minimum;
 			ctrl_cfg.menu_skip_mask =
