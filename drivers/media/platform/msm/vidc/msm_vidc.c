@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -21,6 +21,8 @@
 #include "msm_vidc_common.h"
 #include <linux/delay.h>
 #include "vidc_hfi_api.h"
+#include "msm_vidc_dcvs.h"
+#include "htc_msm_smem.h"
 
 #define MAX_EVENTS 30
 
@@ -335,21 +337,23 @@ struct buffer_info *device_to_uvaddr(struct msm_vidc_list *buf_list,
 
 	mutex_lock(&buf_list->lock);
 	list_for_each_entry(temp, &buf_list->list, list) {
-        
-        
-        if (temp) {
-            for (i = 0; (i < temp->num_planes)
-                && (i < VIDEO_MAX_PLANES); i++) {
-                if (temp && !temp->inactive &&
-                    temp->device_addr[i] == device_addr)  {
-                    dprintk(VIDC_INFO,
-                    "Found same fd buffer\n");
-                    found = 1;
-                    break;
-                }
-            }
-        }
-        
+		
+		if (temp) {
+			for (i = 0; (i < temp->num_planes)
+				&& (i < VIDEO_MAX_PLANES); i++) {
+				if (temp && !temp->inactive &&
+					temp->device_addr[i] == device_addr)  {
+					dprintk(VIDC_INFO,
+					"Found same fd buffer\n");
+					found = 1;
+					break;
+				}
+			}
+		} else {
+			dprintk(VIDC_ERR,
+				"Get NULL buffer_info!\n");
+		}
+		
 		if (found)
 			break;
 	}
@@ -525,8 +529,10 @@ int map_and_register_buf(struct msm_vidc_inst *inst, struct v4l2_buffer *b)
 		if (rc < 0)
 			goto exit;
 
-		same_fd_handle = get_same_fd_buffer(&inst->registeredbufs,
-					b->m.planes[i].reserved[0]);
+		if (!is_dynamic_output_buffer_mode(b, inst))
+			same_fd_handle = get_same_fd_buffer(
+						&inst->registeredbufs,
+						b->m.planes[i].reserved[0]);
 
 		populate_buf_info(binfo, b, i);
 		if (same_fd_handle) {
@@ -537,6 +543,13 @@ int map_and_register_buf(struct msm_vidc_inst *inst, struct v4l2_buffer *b)
 			binfo->handle[i] = same_fd_handle;
 		} else {
 			if (inst->map_output_buffer) {
+#if 1
+                                dprintk(VIDC_WARN,
+                                        "[Vidc_Mem][%p] Import_%s: UsrAddr(%lx) FD(%d)\n",
+                                        inst, ((get_hal_buffer_type(inst, b) == HAL_BUFFER_INPUT)? "I":"O"),
+                                        binfo->uvaddr[i], b->m.planes[i].reserved[0]);
+#endif
+                                
 				binfo->handle[i] =
 					map_buffer(inst, &b->m.planes[i],
 						get_hal_buffer_type(inst, b));
@@ -555,7 +568,7 @@ int map_and_register_buf(struct msm_vidc_inst *inst, struct v4l2_buffer *b)
 					b->m.planes[i].m.userptr;
 			}
 		}
-		
+		/* We maintain one ref count for all planes*/
 		if ((i == 0) && is_dynamic_output_buffer_mode(b, inst)) {
 			rc = buf_ref_get(inst, binfo);
 			if (rc < 0)
@@ -721,7 +734,7 @@ int msm_vidc_prepare_buf(void *instance, struct v4l2_buffer *b)
 		return -EINVAL;
 	}
 
-	
+	/* Map the buffer only for non-kernel clients*/
 	if (b->m.planes[0].reserved[0]) {
 		inst->map_output_buffer = true;
 		if (map_and_register_buf(inst, b))
@@ -1220,6 +1233,7 @@ void *msm_vidc_open(int core_id, int session_type)
 {
 	struct msm_vidc_inst *inst = NULL;
 	struct msm_vidc_core *core = NULL;
+        struct smem_client *smem_client = NULL;
 	int rc = 0;
 	int i = 0;
 	if (core_id >= MSM_VIDC_CORES_MAX ||
@@ -1250,7 +1264,7 @@ void *msm_vidc_open(int core_id, int session_type)
 	mutex_init(&inst->lock);
 
 	INIT_MSM_VIDC_LIST(&inst->pendingq);
-	INIT_MSM_VIDC_LIST(&inst->internalbufs);
+	INIT_MSM_VIDC_LIST(&inst->scratchbufs);
 	INIT_MSM_VIDC_LIST(&inst->persistbufs);
 	INIT_MSM_VIDC_LIST(&inst->pending_getpropq);
 	INIT_MSM_VIDC_LIST(&inst->outputbufs);
@@ -1266,12 +1280,17 @@ void *msm_vidc_open(int core_id, int session_type)
 		i <= SESSION_MSG_INDEX(SESSION_MSG_END); i++) {
 		init_completion(&inst->completions[i]);
 	}
-	inst->mem_client = msm_smem_new_client(SMEM_ION,
+	inst->mem_client = htc_msm_smem_new_client(SMEM_ION,
 					&inst->core->resources);
 	if (!inst->mem_client) {
 		dprintk(VIDC_ERR, "Failed to create memory client\n");
 		goto fail_mem_client;
 	}
+
+        smem_client = inst->mem_client;
+        smem_client->inst = inst;
+        
+
 	if (session_type == MSM_VIDC_DECODER) {
 		msm_vdec_inst_init(inst);
 		msm_vdec_ctrl_init(inst);
@@ -1279,7 +1298,7 @@ void *msm_vidc_open(int core_id, int session_type)
 		msm_venc_inst_init(inst);
 		msm_venc_ctrl_init(inst);
 	}
-	msm_comm_init_dcvs(inst);
+	msm_dcvs_init(inst);
 	rc = vb2_bufq_init(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
 			session_type);
 	if (rc) {
@@ -1310,6 +1329,8 @@ void *msm_vidc_open(int core_id, int session_type)
 
 	setup_event_queue(inst, &core->vdev[session_type].vdev);
 
+	pr_info(VIDC_DBG_TAG "Opening video instance finish : %p, %d\n",
+		VIDC_MSG_PRIO2STRING(VIDC_INFO), inst, session_type);
 	return inst;
 fail_init:
 	vb2_queue_release(&inst->bufq[OUTPUT_PORT].vb2_bufq);
@@ -1382,7 +1403,7 @@ int msm_vidc_close(void *instance)
 	int rc = 0;
 	int i;
 
-	if (!inst)
+	if (!inst || !inst->core)
 		return -EINVAL;
 
 	v4l2_fh_del(&inst->event_handler);
@@ -1403,6 +1424,7 @@ int msm_vidc_close(void *instance)
 	mutex_unlock(&inst->registeredbufs.lock);
 
 	core = inst->core;
+
 	mutex_lock(&core->lock);
 	list_for_each_entry_safe(temp, inst_dummy, &core->instances, list) {
 		if (temp == inst)
@@ -1427,6 +1449,11 @@ int msm_vidc_close(void *instance)
 	if (rc)
 		dprintk(VIDC_ERR,
 			"Failed to move video instance to uninit state\n");
+
+	msm_comm_session_clean(inst);
+
+	v4l2_fh_del(&inst->event_handler);
+	v4l2_fh_exit(&inst->event_handler);
 
 	msm_smem_delete_client(inst->mem_client);
 
