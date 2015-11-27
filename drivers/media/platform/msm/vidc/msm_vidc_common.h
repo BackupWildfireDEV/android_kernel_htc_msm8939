@@ -23,6 +23,7 @@ enum load_calc_quirks {
 	LOAD_CALC_NO_QUIRKS = 0,
 	LOAD_CALC_IGNORE_TURBO_LOAD = 1 << 0,
 	LOAD_CALC_IGNORE_THUMBNAIL_LOAD = 1 << 1,
+	LOAD_CALC_IGNORE_NON_REALTIME_LOAD = 1 << 2,
 };
 
 struct msm_vidc_core *get_vidc_core(int core_id);
@@ -64,7 +65,7 @@ struct hal_buffer_requirements *get_buff_req_buffer(
 #define IS_PRIV_CTRL(idx) (\
 		(V4L2_CTRL_ID2CLASS(idx) == V4L2_CTRL_CLASS_MPEG) && \
 		V4L2_CTRL_DRIVER_PRIV(idx))
-
+void msm_comm_session_clean(struct msm_vidc_inst *inst);
 int msm_comm_kill_session(struct msm_vidc_inst *inst);
 enum multi_stream msm_comm_get_stream_output_mode(struct msm_vidc_inst *inst);
 enum hal_buffer msm_comm_get_hal_output_buffer(struct msm_vidc_inst *inst);
