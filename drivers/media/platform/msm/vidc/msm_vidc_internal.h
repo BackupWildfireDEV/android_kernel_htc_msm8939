@@ -49,9 +49,6 @@
 /* Maintains the number of FTB's between each FBD over a window */
 #define DCVS_FTB_WINDOW 32
 
-/* Maintains the number of FTB's between each FBD over a window */
-#define DCVS_FTB_WINDOW 32
-
 #define V4L2_EVENT_VIDC_BASE  10
 
 #define SYS_MSG_START VIDC_EVENT_CHANGE
